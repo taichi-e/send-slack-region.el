@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  echo "Usage: $0 -c <channel_id> [-t <keychain_service>] [-a <keychain_account>]"
+  echo "  Token lookup order: SLACK_TOKEN env -> Keychain(service/account)"
+  exit 2
+}
+
+CHANNEL_ID=""
+KC_SERVICE="slack-user-token"   # 既存の設定に合わせたデフォルト
+KC_ACCOUNT="slack-status"       # 既存の設定に合わせたデフォルト
+
+while getopts "c:t:a:h" opt; do
+  case "$opt" in
+    c) CHANNEL_ID="$OPTARG" ;;
+    t) KC_SERVICE="$OPTARG" ;;
+    a) KC_ACCOUNT="$OPTARG" ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
+[ -n "$CHANNEL_ID" ] || usage
+
+# 依存確認
+command -v curl >/dev/null 2>&1 || { echo "ERROR: curl not found." >&2; exit 1; }
+command -v jq   >/dev/null 2>&1 || { echo "ERROR: jq not found."   >&2; exit 1; }
+
+# STDIN をファイルへ
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+
+# Token 取得（env優先、なければ Keychain）
+get_token() {
+  local t=""
+  if command -v security >/dev/null 2>&1; then
+    t=$(security find-generic-password -s slack-user-token -a slack-status -w 2>/dev/null || true)
+  fi
+  if [[ -z "${t}" ]]; then
+    t="${SLACK_TOKEN:-}"
+  fi
+  if [[ -z "${t}" ]]; then
+    echo "ERROR: Slack token not found. Set Keychain item (slack-user-token) or SLACK_TOKEN env." >&2
+    exit 1
+  fi
+  echo "${t}"
+}
+TOKEN=$(get_token)
+
+# サイズ制限（Slackの text は ~40,000 chars）
+MAX=40000
+LEN="$(wc -c < "$TMP" | tr -d ' ')"
+if [ "$LEN" -gt "$MAX" ]; then
+  echo "ERROR: Input exceeds ${MAX} bytes. Aborting." >&2
+  exit 1
+fi
+
+# JSON エスケープ
+TEXT="$(jq -Rs . < "$TMP")"
+
+# Slack API 呼び出し
+RESP="$(curl -sS -X POST "https://slack.com/api/chat.postMessage" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  --data "{ \"channel\": \"${CHANNEL_ID}\", \"text\": ${TEXT} }")"
+
+# 成功判定：ok==true 以外は stderr にレスポンスを出す
+if ! echo "$RESP" | jq -e '.ok == true' >/dev/null 2>&1; then
+  echo "Slack API error: $RESP" >&2
+  exit 1
+fi
+
+# 正常時は無出力で終了
+exit 0
